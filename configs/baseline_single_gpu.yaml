@@ -1,0 +1,26 @@
+experiment_name: "baseline_single_gpu_transformer"
+output_dir: "experiments/exp001_baseline_transformer"
+
+seed: 42
+
+model:
+  type: "transformer_sequence_classifier"  # just a descriptive label
+  d_model: 128
+  n_heads: 4
+  num_layers: 2
+  dim_feedforward: 256
+  dropout: 0.1
+  vocab_size: 1000
+  num_classes: 2
+  max_seq_len: 64
+
+data:
+  dataset: "synthetic_sequences"
+
+training:
+  epochs: 3
+  batch_size: 32
+
+distributed:
+  use_ddp: false   # still single-GPU for now
+  backend: "nccl"
