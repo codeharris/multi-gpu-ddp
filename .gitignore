@@ -1,1 +1,8 @@
 .venv
+.venv_cluster
+
+*.err
+*.out
+*.csv
+
+__pycache__
