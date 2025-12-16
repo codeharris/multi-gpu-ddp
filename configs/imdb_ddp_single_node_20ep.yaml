@@ -1,0 +1,26 @@
+experiment_name: "imdb_ddp_single_node_20ep"
+output_dir: "experiments/exp021_imdb_ddp_single_node_20ep"
+
+seed: 42
+
+model:
+  type: "transformer_sequence_classifier"
+  d_model: 128
+  n_heads: 4
+  num_layers: 2
+  dim_feedforward: 256
+  dropout: 0.1
+  vocab_size: 20000
+  num_classes: 2
+  max_seq_len: 128
+
+data:
+  dataset: "imdb_hash"
+
+training:
+  epochs: 20
+  batch_size: 32
+
+distributed:
+  use_ddp: true
+  backend: "nccl"

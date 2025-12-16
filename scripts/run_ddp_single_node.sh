@@ -70,7 +70,7 @@ srun torchrun \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     src/train.py \
-    --config configs/ddp_single_node.yaml
+    --config configs/imdb_ddp_single_node_20ep.yaml
 
 END_TIME=$(date +%s)
 ELAPSED_TIME=$((END_TIME - START_TIME))

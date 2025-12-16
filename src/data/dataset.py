@@ -44,28 +44,57 @@ class SyntheticSequenceDataset(Dataset):
 def build_dataloaders(cfg: dict, dist_state):
     """
     Build train and validation DataLoaders.
+
     Uses DistributedSampler if DDP is enabled.
+
+    Supports:
+      - data.dataset: "synthetic_sequences"  (default)
+      - data.dataset: "imdb_hash"
     """
 
-    seq_len = cfg["model"].get("max_seq_len", 64)
-    vocab_size = cfg["model"].get("vocab_size", 1000)
+    dataset_name = cfg["data"].get("dataset", "synthetic_sequences")
     batch_size = cfg["training"]["batch_size"]
 
-    train_dataset = SyntheticSequenceDataset(
-        size=2000,
-        seq_len=seq_len,
-        vocab_size=vocab_size,
-        threshold_factor=0.5,
-    )
+    # Common model-related settings
+    seq_len = cfg["model"].get("max_seq_len", 64)
+    vocab_size = cfg["model"].get("vocab_size", 1000)
 
-    val_dataset = SyntheticSequenceDataset(
-        size=400,
-        seq_len=seq_len,
-        vocab_size=vocab_size,
-        threshold_factor=0.5,
-    )
+    # --- Choose dataset based on config ---
+    if dataset_name == "synthetic_sequences":
+        train_dataset = SyntheticSequenceDataset(
+            size=2000,
+            seq_len=seq_len,
+            vocab_size=vocab_size,
+            threshold_factor=0.5,
+        )
 
-    # Distributed samplers for DDP
+        val_dataset = SyntheticSequenceDataset(
+            size=400,
+            seq_len=seq_len,
+            vocab_size=vocab_size,
+            threshold_factor=0.5,
+        )
+
+    elif dataset_name == "imdb_hash":
+        # Import here to avoid dependency issues if imdb is not used
+        from data.imdb_dataset import IMDBHashDataset
+
+        train_dataset = IMDBHashDataset(
+            split="train",
+            vocab_size=vocab_size,
+            max_seq_len=seq_len,
+        )
+
+        val_dataset = IMDBHashDataset(
+            split="test",
+            vocab_size=vocab_size,
+            max_seq_len=seq_len,
+        )
+
+    else:
+        raise ValueError(f"Unknown dataset name in config: {dataset_name}")
+
+    # --- Distributed samplers for DDP ---
     if dist_state.use_ddp:
         train_sampler = DistributedSampler(
             train_dataset,

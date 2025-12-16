@@ -1,7 +1,6 @@
 import argparse
-import time
-import os
 import csv
+import time
 from pathlib import Path
 
 import torch
@@ -13,153 +12,119 @@ from config import load_config
 from distributed import setup_distributed, cleanup_distributed
 from data.dataset import build_dataloaders
 from models.transformer_model import build_model
-from utils.metrics import AverageMeter
-from utils.logging import print_rank0
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Transformer training with optional PyTorch DDP."
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/baseline_single_gpu.yaml",
-        help="Path to YAML config file.",
-    )
-    return parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", type=str, required=True)
+    return p.parse_args()
+
+
+class AverageMeter:
+    def __init__(self):
+        self.sum = 0.0
+        self.count = 0
+
+    def update(self, v, n=1):
+        self.sum += float(v) * n
+        self.count += n
+
+    @property
+    def avg(self):
+        return self.sum / max(self.count, 1)
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
-    loss_meter = AverageMeter()
+    meter = AverageMeter()
+    start = time.time()
 
-    start_time = time.time()
-
-    for batch_idx, (inputs, targets) in enumerate(loader):
-        inputs = inputs.to(device)
-        targets = targets.to(device)
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
-
+        out = model(x)
+        loss = criterion(out, y)
         loss.backward()
         optimizer.step()
 
-        loss_meter.update(loss.item(), n=inputs.size(0))
+        meter.update(loss.item(), x.size(0))
 
-    epoch_time = time.time() - start_time
-    return loss_meter.avg, epoch_time
+    return meter.avg, time.time() - start
 
 
+@torch.no_grad()
 def validate(model, loader, criterion, device):
     model.eval()
-    loss_meter = AverageMeter()
-    correct = 0
-    total = 0
+    meter = AverageMeter()
+    correct = total = 0
 
-    with torch.no_grad():
-        for inputs, targets in loader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss_meter.update(loss.item(), n=inputs.size(0))
+        out = model(x)
+        loss = criterion(out, y)
+        meter.update(loss.item(), x.size(0))
 
-            preds = outputs.argmax(dim=1)
-            correct += (preds == targets).sum().item()
-            total += targets.size(0)
+        pred = out.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
 
-    avg_loss = loss_meter.avg
-    accuracy = correct / max(total, 1)
-
-    return avg_loss, accuracy
+    return meter.avg, correct / max(total, 1)
 
 
 def main():
-    # 1. Parse args and load config
     args = parse_args()
     cfg = load_config(args.config)
 
-    # 2. Setup device / DDP state
     dist_state = setup_distributed(cfg["distributed"])
     device = dist_state.device
 
-    # 3. Prepare output directory (rank 0 only)
-    output_dir = Path(cfg["output_dir"])
-    if dist_state.is_main_process:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        metrics_path = output_dir / "metrics.csv"
-        # Write header fresh each run
-        with metrics_path.open("w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["epoch", "train_loss", "train_time", "val_loss", "val_acc"])
-    else:
-        metrics_path = None  # not used on non-main ranks
-
-    # 4. Build dataloaders
     train_loader, val_loader = build_dataloaders(cfg, dist_state)
 
-    # 5. Build model, loss, optimizer
-    model = build_model(cfg["model"])
-    model = model.to(device)
-
+    model = build_model(cfg["model"]).to(device)
     if dist_state.use_ddp:
-        # Wrap with DistributedDataParallel
-        model = DDP(
-            model,
-            device_ids=[dist_state.local_rank] if device.type == "cuda" else None,
-            output_device=dist_state.local_rank if device.type == "cuda" else None,
-        )
+        model = DDP(model, device_ids=[dist_state.local_rank])
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=3e-4,
-    )
+    optimizer = optim.Adam(model.parameters(), lr=3e-4)
 
-    num_epochs = cfg["training"]["epochs"]
+    out_dir = Path(cfg["output_dir"])
+    metrics_path = out_dir / "metrics.csv"
 
-    # 6. Training loop
-    for epoch in range(num_epochs):
-        # If using DistributedSampler, ensure different shuffling each epoch
-        if dist_state.use_ddp and hasattr(train_loader, "sampler") and train_loader.sampler is not None:
-            try:
-                train_loader.sampler.set_epoch(epoch)
-            except AttributeError:
-                pass
+    if dist_state.is_main_process:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with metrics_path.open("w", newline="") as f:
+            csv.writer(f).writerow(
+                ["epoch", "train_loss", "train_time", "val_loss", "val_acc"]
+            )
+        print("🛠 Main process active, starting training", flush=True)
 
-        train_loss, train_time = train_one_epoch(
+    epochs = cfg["training"]["epochs"]
+
+    for epoch in range(epochs):
+        if dist_state.use_ddp:
+            train_loader.sampler.set_epoch(epoch)
+
+        tr_loss, tr_time = train_one_epoch(
             model, train_loader, criterion, optimizer, device
         )
         val_loss, val_acc = validate(model, val_loader, criterion, device)
 
-        # Print to console (main process only)
-        print_rank0(
-            f"Epoch {epoch + 1}/{num_epochs} | "
-            f"train_loss={train_loss:.4f} (time {train_time:.2f}s) | "
-            f"val_loss={val_loss:.4f}, val_acc={val_acc:.3f}",
-            is_main_process=dist_state.is_main_process,
-        )
-
-        # Append to metrics.csv (main process only)
-        if dist_state.is_main_process and metrics_path is not None:
+        if dist_state.is_main_process:
+            print(
+                f"Epoch {epoch+1}/{epochs} | "
+                f"train_loss={tr_loss:.4f} (time {tr_time:.2f}s) | "
+                f"val_loss={val_loss:.4f}, val_acc={val_acc:.3f}",
+                flush=True,
+            )
             with metrics_path.open("a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(
-                    [
-                        epoch + 1,
-                        f"{train_loss:.6f}",
-                        f"{train_time:.6f}",
-                        f"{val_loss:.6f}",
-                        f"{val_acc:.6f}",
-                    ]
+                csv.writer(f).writerow(
+                    [epoch + 1, tr_loss, tr_time, val_loss, val_acc]
                 )
 
-    # 7. Cleanup (for DDP)
     cleanup_distributed(dist_state)
 
 
