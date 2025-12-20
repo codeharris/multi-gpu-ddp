@@ -1,0 +1,26 @@
+experiment_name: "amazon_polarity_ddp_single_node"
+output_dir: "experiments/exp101_amazon_polarity_ddp_single_node"
+
+seed: 42
+
+model:
+  type: "transformer_sequence_classifier"
+  d_model: 128
+  n_heads: 4
+  num_layers: 2
+  dim_feedforward: 256
+  dropout: 0.1
+  vocab_size: 50000
+  num_classes: 2
+  max_seq_len: 128
+
+data:
+  dataset: "amazon_polarity_hash"
+
+training:
+  epochs: 5
+  batch_size: 32       # per GPU
+
+distributed:
+  use_ddp: true
+  backend: "nccl"

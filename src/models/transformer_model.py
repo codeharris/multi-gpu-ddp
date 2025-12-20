@@ -1,6 +1,10 @@
 import math
 import torch
 import torch.nn as nn
+try:
+    from transformers import AutoModelForSequenceClassification
+except Exception:
+    AutoModelForSequenceClassification = None
 
 
 class PositionalEncoding(nn.Module):
@@ -84,37 +88,46 @@ class TransformerSequenceClassifier(nn.Module):
 
 
 def build_model(cfg_model: dict) -> nn.Module:
-    """
-    Build TransformerSequenceClassifier based on the model config.
+        """
+        Build a model based on the model config.
 
-    Expected keys in cfg_model:
-      - d_model
-      - n_heads
-      - num_layers
-      - dim_feedforward
-      - dropout
-      - vocab_size
-      - num_classes
-      - max_seq_len
-    """
-    d_model = cfg_model.get("d_model", 128)
-    n_heads = cfg_model.get("n_heads", 4)
-    num_layers = cfg_model.get("num_layers", 2)
-    dim_feedforward = cfg_model.get("dim_feedforward", 256)
-    dropout = cfg_model.get("dropout", 0.1)
-    vocab_size = cfg_model.get("vocab_size", 1000)
-    num_classes = cfg_model.get("num_classes", 2)
-    max_seq_len = cfg_model.get("max_seq_len", 64)
+        Supported types:
+            - "transformer_sequence_classifier" (default): custom encoder classifier
+            - "hf_sequence_classifier": Hugging Face pretrained model fine-tuning
 
-    model = TransformerSequenceClassifier(
-        vocab_size=vocab_size,
-        d_model=d_model,
-        n_heads=n_heads,
-        num_layers=num_layers,
-        dim_feedforward=dim_feedforward,
-        num_classes=num_classes,
-        max_seq_len=max_seq_len,
-        dropout=dropout,
-    )
+        For hf_sequence_classifier, expected keys:
+            - hf_model_name (e.g., 'distilbert-base-uncased')
+            - num_classes
+        """
+        model_type = cfg_model.get("type", "transformer_sequence_classifier")
 
-    return model
+        if model_type == "hf_sequence_classifier":
+                if AutoModelForSequenceClassification is None:
+                        raise ImportError("transformers is not installed. Please install it to use hf_sequence_classifier.")
+                hf_name = cfg_model.get("hf_model_name", "distilbert-base-uncased")
+                num_classes = cfg_model.get("num_classes", 2)
+                model = AutoModelForSequenceClassification.from_pretrained(hf_name, num_labels=num_classes)
+                return model
+
+        # Default: internal Transformer
+        d_model = cfg_model.get("d_model", 128)
+        n_heads = cfg_model.get("n_heads", 4)
+        num_layers = cfg_model.get("num_layers", 2)
+        dim_feedforward = cfg_model.get("dim_feedforward", 256)
+        dropout = cfg_model.get("dropout", 0.1)
+        vocab_size = cfg_model.get("vocab_size", 1000)
+        num_classes = cfg_model.get("num_classes", 2)
+        max_seq_len = cfg_model.get("max_seq_len", 64)
+
+        model = TransformerSequenceClassifier(
+                vocab_size=vocab_size,
+                d_model=d_model,
+                n_heads=n_heads,
+                num_layers=num_layers,
+                dim_feedforward=dim_feedforward,
+                num_classes=num_classes,
+                max_seq_len=max_seq_len,
+                dropout=dropout,
+        )
+
+        return model

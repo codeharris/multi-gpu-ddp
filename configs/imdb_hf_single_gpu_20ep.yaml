@@ -1,0 +1,19 @@
+experiment_name: "imdb_hf_single_gpu_20ep"
+output_dir: "experiments/exp030_imdb_hf_single_gpu_20ep"
+
+seed: 42
+
+model:
+  type: "hf_sequence_classifier"
+  hf_model_name: "distilbert-base-uncased"
+  num_classes: 2
+
+data:
+  dataset: "imdb_hf_tok"
+
+training:
+  epochs: 20
+  batch_size: 32
+
+distributed:
+  use_ddp: false

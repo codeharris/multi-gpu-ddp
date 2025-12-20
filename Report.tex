@@ -1,0 +1,192 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{microtype}
+\geometry{margin=1in}
+\title{Distributed Training of Transformer Models with PyTorch DDP on HPC}
+\author{<Your Name>}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report presents a comprehensive technical overview of a PyTorch-based project for distributed training of transformer models using Distributed Data Parallel (DDP) on High-Performance Computing (HPC) systems. The report details the model architecture, distributed setup, dataset design, optimizer and training loop, configuration management, and experiment orchestration, with in-depth explanations of the code and design choices.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction}
+This report presents a detailed technical overview of a PyTorch-based project designed for distributed training of transformer models using Distributed Data Parallel (DDP) on High-Performance Computing (HPC) systems. The project is structured to enable scalable, efficient training of deep learning models across multiple GPUs and nodes, with a focus on sequence classification tasks. The codebase is modular, supporting both synthetic and real-world datasets, and is intended for research and experimentation in scalable deep learning.
+
+The following sections provide an in-depth analysis of the distributed training setup, model architecture, data pipeline, optimization strategies, configuration management, and evaluation methodology. All technical details are derived from the codebase and are explained with a focus on design rationale and implementation best practices. Concrete file references are annotated to the exact implementation locations in the repository tree for traceability.
+
+The primary training entrypoint is \texttt{src/train.py}, which orchestrates configuration loading, distributed initialization, model/dataloader construction, the training/validation loops, and metrics logging. The repository provides several YAML configurations under \texttt{configs/} for single-GPU and DDP experiments on both synthetic and IMDB datasets.
+
+\section{Distributed Training Setup}
+\subsection{Overview}
+Distributed training is implemented using PyTorch's Distributed Data Parallel (DDP) framework, which enables synchronous data parallelism across multiple GPUs and nodes. The project is designed to be compatible with HPC environments, leveraging the NCCL backend for high-performance GPU communication.
+
+\subsection{Initialization and Process Management}
+The distributed setup is managed in \texttt{src/distributed.py}. The \texttt{setup\_distributed} function reads environment variables (\texttt{RANK}, \texttt{WORLD\_SIZE}, \texttt{LOCAL\_RANK}) to determine the process topology. Each process is assigned a specific GPU using \texttt{torch.cuda.set\_device}, and the process group is initialized with \texttt{dist.init\_process\_group} using the NCCL backend. The main process (rank 0) is responsible for logging and output management. A dataclass \texttt{DistState} encapsulates \emph{use\_ddp}, ranks, world size, device, and \emph{is\_main\_process} for downstream logic.
+
+DDP is enabled by configuration (\texttt{distributed.use\_ddp}) and affects both model wrapping and data sampling. When \texttt{use\_ddp=false}, the code falls back to single-device execution with CUDA if available, otherwise CPU (see \texttt{setup\_distributed}).
+
+\subsection{Data Parallelism}
+Each process maintains its own model replica and optimizer. Gradients are synchronized across processes after each backward pass. The \texttt{DistributedSampler} ensures that each process receives a unique subset of the data, preventing overlap and ensuring efficient utilization of the dataset.
+
+\subsection{Cleanup}
+After training, \texttt{dist.destroy\_process\_group} is called to clean up resources. This ensures that all distributed resources are properly released, which is critical in HPC environments where jobs are scheduled and resources are shared.
+
+\subsection{Launcher and Environment}
+On single-node multi-GPU runs, a typical launcher is \texttt{torchrun --nproc\_per\_node=N src/train.py --config ...}, which exports the \texttt{RANK}, \texttt{LOCAL\_RANK}, and \texttt{WORLD\_SIZE} variables expected by \texttt{setup\_distributed}. For multi-node runs under a scheduler (e.g., Slurm), the NCCL backend requires proper network interfaces and rendezvous settings (e.g., \texttt{MASTER\_ADDR}, \texttt{MASTER\_PORT}). The provided configs \texttt{configs/ddp\_single\_node.yaml} and \texttt{configs/ddp\_multinode.yaml} set \texttt{use\_ddp=true} and \texttt{backend=\"nccl\"} to select the appropriate mode.
+
+\section{Model Architecture}
+\subsection{Transformer Sequence Classifier}
+The core model is a transformer-based sequence classifier, implemented in \texttt{src/models/transformer\_model.py}. The architecture consists of the following components:
+\begin{itemize}
+    \item \textbf{Embedding Layer}: Maps input token IDs to dense vectors of dimension $d_{model}$.
+    \item \textbf{Positional Encoding}: Implements sinusoidal positional encoding as described in Vaswani et al. (2017), allowing the model to capture sequence order information.
+    \item \textbf{Transformer Encoder}: Utilizes PyTorch's built-in \texttt{nn.TransformerEncoderLayer} and \texttt{nn.TransformerEncoder} modules. The number of layers, attention heads, and feedforward dimensions are configurable.
+    \item \textbf{Pooling}: Applies mean pooling across the sequence dimension to obtain a fixed-size representation.
+    \item \textbf{Classifier Head}: A linear layer maps the pooled representation to logits over the target classes.
+\end{itemize}
+
+\subsection{Configuration}
+Model hyperparameters (e.g., $d_{model}$, number of heads, layers, feedforward size, dropout, vocabulary size, maximum sequence length, and number of classes) are specified in YAML configuration files and passed to the model builder function. This design enables rapid experimentation with different model sizes and architectures.
+
+\subsection{Positional Encoding}
+Sinusoidal positional encodings are computed once up to \texttt{max\_len} and stored as a non-trainable buffer via \texttt{register\_buffer}. For position $p$ and channel $2i$ and $2i+1$:
+\begin{align}
+\mathrm{PE}(p, 2i) &= \sin\left( p / 10000^{2i/d_{model}} \right),\\
+\mathrm{PE}(p, 2i+1) &= \cos\left( p / 10000^{2i/d_{model}} \right).
+\end{align}
+The encoding tensor (shape $1 \times L \times d_{model}$) is added to the input embeddings elementwise before the encoder stack. This preserves magnitude and allows the model to disambiguate absolute positions while attending across the sequence.
+
+\subsection{Self-Attention and Encoder Layers}
+Each \texttt{TransformerEncoderLayer} follows the standard composition:
+\begin{enumerate}
+    \item Multi-Head Self-Attention (MHSA): $\mathrm{MHA}(Q,K,V)$ with $h$ heads. For a head, $\mathrm{Attn}(Q,K,V) = \mathrm{softmax}\left( \frac{QK^\top}{\sqrt{d_k}} \right) V$.
+    \item Residual connection and LayerNorm.
+    \item Position-wise Feedforward Network (FFN): $\mathrm{FFN}(x) = \max(0, xW_1 + b_1) W_2 + b_2$.
+    \item Residual connection and LayerNorm.
+\end{enumerate}
+The implementation sets \texttt{batch\_first=true}, so tensors use shape $(B, L, d)$. Complexity of MHSA per layer is $\mathcal{O}(B \cdot h \cdot L^2 \cdot d_k)$ in time and $\mathcal{O}(B \cdot h \cdot L^2)$ in memory for attention maps, motivating careful selection of $L$ on HPC runs.
+
+\subsection{Sequence Pooling and Classification}
+The encoder output (shape $B \times L \times d$) is mean-pooled along the sequence dimension to yield a fixed-length representation (shape $B \times d$). A dropout layer and a linear classifier produce logits (shape $B \times C$). The choice of mean pooling provides a simple, permutation-invariant summary; alternatives include using a dedicated \texttt{[CLS]} token or attention pooling.
+
+\section{Dataset and Data Pipeline}
+\subsection{Synthetic Sequence Dataset}
+Implemented in \texttt{src/data/dataset.py}, the synthetic dataset generates random sequences of token IDs. Each sample is a sequence of length $L$ with tokens in $[0, V)$, where $V$ is the vocabulary size. The label is determined by whether the sum of token IDs exceeds a configurable threshold. This dataset is useful for controlled experiments and benchmarking distributed training performance.
+
+\subsection{IMDB Hash Dataset}
+The IMDB dataset, implemented in \texttt{src/data/imdb\_dataset.py}, uses the HuggingFace Datasets library to load movie review texts. Tokenization is performed by splitting on whitespace and mapping each token to an integer via a hash function modulo the vocabulary size. Sequences are padded or truncated to a fixed length. This approach avoids the need for a pre-built vocabulary and is efficient for large-scale experiments.
+
+\subsection{Amazon Polarity Dataset}
+The Amazon Reviews Polarity dataset is integrated via \texttt{src/data/amazon\_dataset.py}. It loads the \texttt{amazon\_polarity} corpus (\~3.6M training and \~400k test examples) with binary sentiment labels. For each example, the review \emph{title} and \emph{content} are concatenated to form the input text. The same hash-based tokenization is applied (whitespace split, then \texttt{hash(token) \% vocab\_size}), followed by truncation/padding to a fixed \texttt{max\_seq\_len}. This design keeps preprocessing fast and stateless, avoids vocabulary construction, and scales well for HPC throughput experiments.
+
+Given the substantially larger size compared to IMDB, this dataset is suitable for long-running jobs and scaling studies (e.g., speedup and efficiency with increasing GPU counts). Recommended starting hyperparameters are \texttt{vocab\_size=50k} and \texttt{max\_seq\_len=128} or 256. Larger sequence lengths increase both memory footprint and compute cost per step. Example configurations are provided in \texttt{configs/amazon\_polarity\_single\_gpu.yaml} and \texttt{configs/amazon\_polarity\_ddp\_single\_node.yaml}.
+
+\subsection{Data Loading and Sampling}
+Data loading is handled by PyTorch's \texttt{DataLoader}, with optional use of \texttt{DistributedSampler} for DDP. The sampler ensures that each process receives a unique shard of the data, which is critical for correct and efficient distributed training. Batch size and sequence length are configurable via YAML files.
+
+In DDP mode, the sampler's epoch is set each loop iteration (\texttt{sampler.set\_epoch(epoch)}) to reshuffle different shards per epoch across ranks, avoiding alignment artifacts. The training loader uses \texttt{drop\_last=true} to maintain uniform batch sizes per replica, which simplifies gradient synchronization.
+
+For synthetic experiments, the configuration uses $\text{train size}=2000$, $\text{val size}=400$, $L=64$, $V=1000$, leading to a maximum sum of $(V-1)\cdot L$, with the threshold at $0.5\cdot (V-1)L$. This yields a balanced but noisy classification rule suitable for sanity checks and throughput measurements.
+
+\section{Training Loop, Optimizer, and Loss}
+\subsection{Training Loop}
+The training loop is implemented in \texttt{src/train.py}. For each epoch, the model is set to training mode, and batches are iterated over. Inputs and labels are moved to the appropriate device. The optimizer's gradients are zeroed, the model computes logits, and the loss is calculated using the criterion. Backpropagation is performed, and the optimizer updates the model parameters. Loss values are tracked using an \texttt{AverageMeter} utility.
+
+\subsection{Validation}
+After each epoch, the model is evaluated on the validation set. The model is set to evaluation mode, and predictions are made without gradient computation. Validation loss and accuracy are computed and logged.
+
+\subsection{Optimizer and Loss Function}
+The project uses the Adam optimizer (\texttt{torch.optim.Adam}) with a learning rate of $3 \times 10^{-4}$. The loss function is cross-entropy loss (\texttt{nn.CrossEntropyLoss}), suitable for multi-class classification tasks. These choices are standard for transformer-based models and provide stable convergence.
+
+\subsection{Distributed Considerations}
+When DDP is enabled, the model is wrapped in \texttt{DistributedDataParallel}, and the data loader uses a distributed sampler. The sampler's epoch is set at the start of each epoch to ensure proper shuffling across processes.
+
+\subsection{Mathematical Formulation}
+Let $x \in \mathbb{N}^{B\times L}$ be input token IDs, $E \in \mathbb{R}^{V\times d}$ the embedding matrix, and $P \in \mathbb{R}^{L\times d}$ the positional encodings. The input to the encoder is $X = \mathrm{Embed}(x) + P$, with $X \in \mathbb{R}^{B\times L\times d}$. After $N$ encoder layers producing $H \in \mathbb{R}^{B\times L\times d}$, we compute a pooled representation $h = \frac{1}{L}\sum\limits_{t=1}^L H_{:,t,:}$, apply dropout, then logits $z = h W + b$, with $W \in \mathbb{R}^{d\times C}$.
+
+For targets $y \in \{1,\dots,C\}^B$, cross-entropy loss is
+\begin{equation}
+\mathcal{L}_{CE} = - \frac{1}{B} \sum_{i=1}^B \log \frac{\exp( z^{(i)}_{y^{(i)}} )}{ \sum_{c=1}^C \exp( z^{(i)}_c ) }.
+\end{equation}
+
+Adam maintains first/second-moment estimates $m_t, v_t$ and updates parameters $\theta$ as
+\begin{align}
+m_t &= \beta_1 m_{t-1} + (1-\beta_1) \, g_t, \\
+v_t &= \beta_2 v_{t-1} + (1-\beta_2) \, g_t^2, \\
+\hat m_t &= m_t/(1-\beta_1^t), \quad \hat v_t = v_t/(1-\beta_2^t), \\
+\theta_{t+1} &= \theta_t - \eta \, \frac{\hat m_t}{\sqrt{\hat v_t}+\epsilon}.
+\end{align}
+Default hyperparameters (not explicitly overridden here) are $\beta_1=0.9, \beta_2=0.999, \epsilon=10^{-8}$.
+
+Implementation details include zeroing gradients with \texttt{optimizer.zero\_grad(set\_to\_none=true)} for reduced memory writes and using \texttt{non\_blocking=true} in device transfers to overlap host-to-device copies when pinned memory is enabled upstream.
+
+\subsection{Numerical Stability and Extensions}
+While the current implementation does not enable mixed precision (AMP) or gradient clipping, both are common in large-scale transformer training: AMP reduces memory bandwidth and speeds up matmul operations on modern GPUs; clipping ($\ell_2$-norm) can stabilize early training. Learning rate schedulers (e.g., cosine decay with warmup) are also standard enhancements and can be integrated with minimal changes to \texttt{src/train.py}.
+
+\section{Configuration and Experiment Management}
+\subsection{Configuration}
+Experiment configuration is managed via YAML files, loaded at runtime using the \texttt{load\_config} function in \texttt{src/config.py}. Configurations specify model hyperparameters, data parameters, training settings (batch size, epochs), distributed settings, and output directories. This approach enables reproducibility and easy modification of experimental parameters.
+
+\subsection{Experiment Scripts}
+Shell scripts in the \texttt{scripts/} directory provide entry points for running experiments in different modes (single GPU, DDP single node, DDP multinode, IMDB experiments). These scripts set up the environment and invoke the main training script with the appropriate configuration file.
+
+\subsection{Output and Logging}
+Metrics (training loss, validation loss, validation accuracy, epoch time) are logged to CSV files in the output directory. Logging is restricted to the main process to avoid duplication. The \texttt{print\_rank0} utility ensures that only rank 0 prints to the console, which is important for clean output in distributed settings.
+
+\subsection{Reproducibility Considerations}
+All configs include a \texttt{seed} field; however, seeding is not currently applied in \texttt{src/train.py}. For strict reproducibility, add deterministic seeding for Python, NumPy, and PyTorch (including CUDA) and configure cuDNN determinism where applicable. In DDP, ensure every rank applies identical seeds modulo data sharding.
+
+\subsection{Configuration Examples}
+Representative files under \texttt{configs/}:
+\begin{itemize}
+  \item \texttt{baseline\_single\_gpu.yaml}: synthetic dataset, $d=128$, $h=4$, $N=2$, FFN size 256, dropout 0.1, $L=64$, $V=1000$, epochs=3, batch size=32, single-GPU.
+  \item \texttt{ddp\_single\_node.yaml}: same model and data as baseline but with \texttt{use\_ddp=true}; batch size is per-GPU.
+  \item \texttt{imdb\_single\_gpu\_20ep.yaml} and \texttt{imdb\_ddp\_single\_node\_20ep.yaml}: IMDB hash dataset with $V=20000$, $L=128$, 20 epochs; DDP variant enables \texttt{use\_ddp}.
+\end{itemize}
+
+\section{Results and Evaluation}
+\subsection{Metrics}
+The primary metrics tracked are training loss, validation loss, and validation accuracy. These are logged per epoch and can be visualized using the provided plotting scripts. The modular design allows for easy extension to additional metrics as needed.
+
+\subsection{Scalability and Performance}
+The use of DDP and distributed data loading enables the project to scale efficiently across multiple GPUs and nodes. Synthetic datasets allow for controlled benchmarking of throughput and scaling behavior, while the IMDB dataset provides a real-world evaluation scenario.
+
+\subsection{Reproducibility}
+The use of configuration files and deterministic data partitioning (via distributed samplers) ensures that experiments are reproducible. Output directories are organized by experiment, and all relevant metrics are saved for post-hoc analysis.
+
+\subsection{Speedup and Efficiency}
+The plotting script \texttt{scripts/plot\_results.py} computes speedup and parallel efficiency from per-epoch training times. Given average epoch times $T_1$ (1 GPU) and $T_N$ ($N$ GPUs), the speedup is
+\begin{equation}
+S_N = \frac{T_1}{T_N}, \qquad \text{and efficiency } E_N = \frac{S_N}{N}.
+\end{equation}
+These aggregate metrics help assess scaling behavior relative to ideal linear speedup $S_N=N$.
+
+\subsection{Accuracy Parity}
+Under standard DDP with synchronous SGD/Adam, validation accuracy should match single-GPU runs when effective batch sizes are held constant (potentially requiring learning rate tuning when increasing global batch size). The current setup uses identical per-GPU batch sizes across configurations; if total batch size increases with more GPUs, consider scaling the learning rate or employing warmup.
+
+\section{Conclusion}
+This project demonstrates a robust and extensible framework for distributed training of transformer models using PyTorch DDP on HPC systems. The modular design, support for both synthetic and real datasets, and comprehensive configuration management make it suitable for research and large-scale experimentation. The technical choices made in model architecture, data pipeline, and distributed setup reflect best practices in scalable deep learning.
+
+\paragraph{Limitations and Future Work.} The codebase can be extended with: (i) automatic mixed precision (AMP) for improved throughput, (ii) gradient clipping for stability, (iii) learning rate schedules with warmup, (iv) checkpointing and model saving, (v) explicit seeding and deterministic flags for full reproducibility, (vi) richer logging (e.g., TensorBoard) and comprehensive evaluation metrics, and (vii) support for longer sequences via memory-efficient attention mechanisms.
+
+\section*{References}
+\begin{enumerate}
+  \item Ashish Vaswani, Noam Shazeer, Niki Parmar, et al. \emph{Attention Is All You Need}. NeurIPS 2017.
+  \item Diederik P. Kingma and Jimmy Ba. \emph{Adam: A Method for Stochastic Optimization}. ICLR 2015.
+  \item PyTorch Distributed Documentation: \url{https://pytorch.org/docs/stable/distributed.html}
+  \item PyTorch Transformer API: \url{https://pytorch.org/docs/stable/generated/torch.nn.Transformer.html}
+  \item HuggingFace Datasets: \url{https://huggingface.co/docs/datasets}
+\end{enumerate}
+
+\end{document}

@@ -2,3 +2,4 @@ numpy
 pyyaml
 tqdm
 datasets
+transformers

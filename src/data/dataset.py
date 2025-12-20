@@ -91,6 +91,49 @@ def build_dataloaders(cfg: dict, dist_state):
             max_seq_len=seq_len,
         )
 
+    elif dataset_name == "amazon_polarity_hash":
+        from data.amazon_dataset import AmazonPolarityHashDataset
+
+        train_dataset = AmazonPolarityHashDataset(
+            split="train",
+            vocab_size=vocab_size,
+            max_seq_len=seq_len,
+        )
+
+        val_dataset = AmazonPolarityHashDataset(
+            split="test",
+            vocab_size=vocab_size,
+            max_seq_len=seq_len,
+        )
+
+    elif dataset_name == "imdb_hf_tok":
+        from data.imdb_hf_dataset import IMDBHFDataset
+        tok_name = cfg["model"].get("hf_model_name", cfg["data"].get("tokenizer_name", "distilbert-base-uncased"))
+        train_dataset = IMDBHFDataset(
+            split="train",
+            tokenizer_name=tok_name,
+            max_seq_len=seq_len,
+        )
+        val_dataset = IMDBHFDataset(
+            split="test",
+            tokenizer_name=tok_name,
+            max_seq_len=seq_len,
+        )
+
+    elif dataset_name == "amazon_polarity_hf_tok":
+        from data.amazon_hf_dataset import AmazonPolarityHFDataset
+        tok_name = cfg["model"].get("hf_model_name", cfg["data"].get("tokenizer_name", "distilbert-base-uncased"))
+        train_dataset = AmazonPolarityHFDataset(
+            split="train",
+            tokenizer_name=tok_name,
+            max_seq_len=seq_len,
+        )
+        val_dataset = AmazonPolarityHFDataset(
+            split="test",
+            tokenizer_name=tok_name,
+            max_seq_len=seq_len,
+        )
+
     else:
         raise ValueError(f"Unknown dataset name in config: {dataset_name}")
 

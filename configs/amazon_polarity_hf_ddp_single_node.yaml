@@ -1,0 +1,20 @@
+experiment_name: "amazon_polarity_hf_ddp_single_node"
+output_dir: "experiments/exp102_amazon_polarity_hf_ddp_single_node"
+
+seed: 42
+
+model:
+  type: "hf_sequence_classifier"
+  hf_model_name: "distilbert-base-uncased"
+  num_classes: 2
+
+data:
+  dataset: "amazon_polarity_hf_tok"
+
+training:
+  epochs: 5
+  batch_size: 16   # per GPU; HF models are heavier
+
+distributed:
+  use_ddp: true
+  backend: "nccl"
