@@ -4,7 +4,7 @@
 #SBATCH --ntasks-per-node=4             # Tasks per node (one per GPU)
 #SBATCH --gres=gpu:4                    # GPUs per node
 #SBATCH -c 4                            # CPU cores per task
-#SBATCH --time=0-00:30:00               # Max time
+#SBATCH --time=0-02:00:00               # Max time
 #SBATCH -p gpu                          # GPU partition on Iris
 #SBATCH --output=ddp_2nodes_%j.out
 #SBATCH --error=ddp_2nodes_%j.err
