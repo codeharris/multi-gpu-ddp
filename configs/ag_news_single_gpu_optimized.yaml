@@ -1,0 +1,40 @@
+experiment_name: "ag_news_single_gpu_optimized"
+output_dir: "experiments/exp043_agnews_1gpu_optimized"
+
+seed: 42
+
+model:
+  type: "transformer_sequence_classifier"
+  d_model: 256          # 2x larger: 128 -> 256
+  n_heads: 8            # 2x more: 4 -> 8
+  num_layers: 4         # 2x deeper: 2 -> 4
+  dim_feedforward: 1024 # 4x larger: 256 -> 1024
+  dropout: 0.1
+  vocab_size: 20000
+  num_classes: 4
+  max_seq_len: 256      # 2x longer: 128 -> 256
+
+data:
+  dataset: "ag_news"
+  num_workers: 4        # Increased for larger batches
+  pin_memory: true
+
+training:
+  epochs: 20
+  batch_size: 128       # 4x larger: 32 -> 128
+  learning_rate: 0.001  # Scaled: 0.0005 * 2 (conservative)
+  warmup_steps: 500
+  gradient_clip: 1.0
+
+optimizer:
+  type: "adamw"
+  lr: 0.001
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+distributed:
+  use_ddp: false
+
+logging:
+  log_interval: 50
+  save_checkpoint: true

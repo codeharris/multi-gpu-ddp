@@ -1,0 +1,27 @@
+experiment_name: "ag_news_single_gpu_20ep"
+output_dir: "experiments/exp041_agnews_1gpu_20ep"
+
+seed: 42
+
+model:
+  type: "transformer_sequence_classifier"
+  d_model: 128
+  n_heads: 4
+  num_layers: 2
+  dim_feedforward: 256
+  dropout: 0.1
+  vocab_size: 20000
+  num_classes: 4
+  max_seq_len: 128
+
+data:
+  dataset: "ag_news"
+  num_workers: 2
+  pin_memory: true
+
+training:
+  epochs: 20
+  batch_size: 32
+
+distributed:
+  use_ddp: false

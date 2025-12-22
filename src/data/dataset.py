@@ -1,125 +1,223 @@
+# src/data/dataset.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional
+
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
+try:
+    from datasets import load_dataset
+except Exception:
+    load_dataset = None
 
+
+# -----------------------------
+# Simple hash tokenizer (fast, reproducible, no vocab build)
+# -----------------------------
+def hash_tokenize(text: str, vocab_size: int, max_len: int) -> torch.Tensor:
+    # Basic whitespace tokenization + hashing to [1..vocab_size-1], 0 reserved for PAD
+    tokens = text.lower().split()
+    ids = []
+    for tok in tokens[:max_len]:
+        # stable-ish hash across runs: use python hash is salted per process, so use a custom hash
+        h = 2166136261
+        for c in tok:
+            h ^= ord(c)
+            h *= 16777619
+            h &= 0xFFFFFFFF
+        ids.append(1 + (h % (vocab_size - 1)))
+
+    if len(ids) < max_len:
+        ids.extend([0] * (max_len - len(ids)))
+
+    return torch.tensor(ids, dtype=torch.long)
+
+
+# -----------------------------
+# Datasets
+# -----------------------------
 class SyntheticSequenceDataset(Dataset):
-    """
-    Simple synthetic sequence classification dataset.
+    def __init__(self, n_samples: int, seq_len: int, vocab_size: int, num_classes: int, seed: int = 42):
+        g = torch.Generator()
+        g.manual_seed(seed)
+        self.x = torch.randint(low=1, high=vocab_size, size=(n_samples, seq_len), generator=g)
+        # Simple deterministic labeling: parity of sum (binary), or modulo for multi-class
+        s = self.x.sum(dim=1)
+        self.y = (s % num_classes).long()
 
-    - Each sample is a sequence of token IDs of length seq_len.
-    - Vocabulary size = vocab_size.
-    - Label rule:
-        If sum(token_ids) > threshold -> label 1
-        else -> label 0
-    """
+    def __len__(self) -> int:
+        return self.x.size(0)
 
-    def __init__(self, size: int, seq_len: int, vocab_size: int, threshold_factor: float = 0.5):
-        self.size = size
-        self.seq_len = seq_len
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.x[idx], self.y[idx]
+
+
+class HFTextClassificationDataset(Dataset):
+    """
+    Wraps a HuggingFace dataset split (with fields: text, label)
+    and applies hash tokenization to produce (input_ids, label).
+    """
+    def __init__(
+        self,
+        hf_split,
+        text_field: str,
+        label_field: str,
+        vocab_size: int,
+        max_len: int,
+    ):
+        self.ds = hf_split
+        self.text_field = text_field
+        self.label_field = label_field
         self.vocab_size = vocab_size
+        self.max_len = max_len
 
-        # Threshold for synthetic labels
-        self.max_sum = (vocab_size - 1) * seq_len
-        self.threshold = self.max_sum * threshold_factor
+    def __len__(self) -> int:
+        return len(self.ds)
 
-    def __len__(self):
-        return self.size
-
-    def __getitem__(self, idx):
-        # Random integer sequence [0, vocab_size)
-        x = torch.randint(
-            low=0,
-            high=self.vocab_size,
-            size=(self.seq_len,),
-            dtype=torch.long,
-        )
-
-        seq_sum = x.sum().item()
-        y = 1 if seq_sum > self.threshold else 0
-
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        item = self.ds[int(idx)]
+        text = item[self.text_field]
+        label = int(item[self.label_field])
+        x = hash_tokenize(text, self.vocab_size, self.max_len)
+        y = torch.tensor(label, dtype=torch.long)
         return x, y
 
 
-def build_dataloaders(cfg: dict, dist_state):
+# -----------------------------
+# Public API
+# -----------------------------
+def build_dataloaders(cfg: Dict, dist_state) -> Tuple[DataLoader, DataLoader]:
     """
-    Build train and validation DataLoaders.
-
-    Uses DistributedSampler if DDP is enabled.
-
+    Builds train/val dataloaders based on cfg["data"]["dataset"].
     Supports:
-      - data.dataset: "synthetic_sequences"  (default)
-      - data.dataset: "imdb_hash"
+      - synthetic
+      - imdb_hash
+      - ag_news
     """
+    data_cfg = cfg.get("data", {})
+    dataset_name = data_cfg.get("dataset", "synthetic")
 
-    dataset_name = cfg["data"].get("dataset", "synthetic_sequences")
-    batch_size = cfg["training"]["batch_size"]
+    train_bs = int(cfg["training"]["batch_size"])
+    max_len = int(cfg["model"]["max_seq_len"])
+    vocab_size = int(cfg["model"]["vocab_size"])
+    num_classes = int(cfg["model"]["num_classes"])
 
-    # Common model-related settings
-    seq_len = cfg["model"].get("max_seq_len", 64)
-    vocab_size = cfg["model"].get("vocab_size", 1000)
+    num_workers = int(data_cfg.get("num_workers", 2))
+    pin_memory = bool(data_cfg.get("pin_memory", True))
+    persistent_workers = num_workers > 0  # Avoid worker teardown
 
-    # --- Choose dataset based on config ---
-    if dataset_name == "synthetic_sequences":
+    # -------- build datasets --------
+    if dataset_name == "synthetic":
+        n_train = int(data_cfg.get("n_train", 20000))
+        n_val = int(data_cfg.get("n_val", 5000))
+        seq_len = int(data_cfg.get("seq_len", max_len))
+        seed = int(cfg.get("seed", 42))
+
         train_dataset = SyntheticSequenceDataset(
-            size=2000,
+            n_samples=n_train,
             seq_len=seq_len,
             vocab_size=vocab_size,
-            threshold_factor=0.5,
+            num_classes=num_classes,
+            seed=seed,
         )
-
         val_dataset = SyntheticSequenceDataset(
-            size=400,
+            n_samples=n_val,
             seq_len=seq_len,
             vocab_size=vocab_size,
-            threshold_factor=0.5,
+            num_classes=num_classes,
+            seed=seed + 1,
         )
 
-    elif dataset_name == "imdb_hash":
-        # Import here to avoid dependency issues if imdb is not used
-        from data.imdb_dataset import IMDBHashDataset
+    elif dataset_name in ("imdb_hash", "ag_news"):
+        if load_dataset is None:
+            raise RuntimeError("huggingface 'datasets' is not available. Install it: pip install datasets")
 
-        train_dataset = IMDBHashDataset(
-            split="train",
+        if dataset_name == "imdb_hash":
+            # IMDB: train/test splits. We'll create val from train by small split for quick evaluation.
+            raw = load_dataset("imdb")
+            text_field = "text"
+            label_field = "label"
+            train_split = raw["train"]
+            test_split = raw["test"]
+
+        else:
+            # AG News: train/test
+            raw = load_dataset("ag_news")
+            text_field = "text"
+            label_field = "label"
+            train_split = raw["train"]
+            test_split = raw["test"]
+
+        # Optional: sub-sampling to control runtime (useful for debug)
+        train_limit = data_cfg.get("train_limit", None)
+        val_limit = data_cfg.get("val_limit", None)
+        if train_limit is not None:
+            train_split = train_split.select(range(int(train_limit)))
+        if val_limit is not None:
+            test_split = test_split.select(range(int(val_limit)))
+
+        train_dataset = HFTextClassificationDataset(
+            hf_split=train_split,
+            text_field=text_field,
+            label_field=label_field,
             vocab_size=vocab_size,
-            max_seq_len=seq_len,
+            max_len=max_len,
         )
-
-        val_dataset = IMDBHashDataset(
-            split="test",
+        val_dataset = HFTextClassificationDataset(
+            hf_split=test_split,
+            text_field=text_field,
+            label_field=label_field,
             vocab_size=vocab_size,
-            max_seq_len=seq_len,
+            max_len=max_len,
         )
 
     else:
-        raise ValueError(f"Unknown dataset name in config: {dataset_name}")
+        raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    # --- Distributed samplers for DDP ---
-    if dist_state.use_ddp:
+    # -------- distributed sampler --------
+    if dist_state and getattr(dist_state, "is_distributed", False):
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=dist_state.world_size,
             rank=dist_state.rank,
             shuffle=True,
+            drop_last=False,
         )
-        val_sampler = None
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=dist_state.world_size,
+            rank=dist_state.rank,
+            shuffle=False,
+            drop_last=False,
+        )
+        shuffle = False
     else:
         train_sampler = None
         val_sampler = None
+        shuffle = True
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
-        shuffle=(train_sampler is None),
+        batch_size=train_bs,
+        shuffle=shuffle,
         sampler=train_sampler,
-        drop_last=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+        drop_last=False,
     )
-
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=train_bs,
         shuffle=False,
         sampler=val_sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+        drop_last=False,
     )
 
     return train_loader, val_loader

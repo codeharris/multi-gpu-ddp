@@ -1,0 +1,368 @@
+\documentclass{article}
+
+% Formatting and Packages
+\usepackage{a4wide}
+\usepackage{soul}
+\usepackage{graphicx}
+\usepackage{color}
+\usepackage{enumerate}
+\usepackage{array}
+\usepackage[american]{babel}
+\usepackage{amssymb}
+\usepackage{amsmath}
+\usepackage{clipboard}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{xcolor}
+
+\title{%
+    \large \textbf{HPC - Project} \\
+    \vspace{0.5cm}
+    \LARGE Multi-GPU Accelerated Transformer Training with PyTorch DDP: \\
+    \large Understanding the Limits of Distributed Data Parallelism \\
+}
+
+\author{Amine, Franco, Heriel and Ludovic}
+\date{December 2025}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+The training of modern transformer-based deep learning models is computationally prohibitive on commodity hardware due to massive parameter counts and the quadratic complexity of self-attention mechanisms. This report investigates the utilization of High-Performance Computing (HPC) resources to accelerate this process through Distributed Data Parallel (DDP) training. We implement a distributed training pipeline using PyTorch DDP on a single node equipped with 4 GPUs, focusing on the AG News topic classification task with 120,000 training samples. Our experiments reveal critical insights into the relationship between model size, communication overhead, and parallel efficiency. We tested two model configurations: a baseline small model (128-dim, 2 layers) achieving only 0.46$\times$ speedup (11.5\% efficiency), and an optimized larger model (256-dim, 4 layers) achieving 0.80$\times$ speedup (20\% efficiency). Both configurations exhibited negative scaling, demonstrating that communication overhead can dominate computation even with larger models. We provide rigorous theoretical analysis of the distributed update rules, communication complexity of the ring all-reduce algorithm, and practical limitations imposed by Amdahl's Law. We conclude that while DDP is powerful, achieving positive speedup requires careful consideration of the compute-to-communication ratio, which depends critically on model architecture, batch size, and hardware interconnect bandwidth.
+\end{abstract}
+
+\section{Introduction}
+In recent years, the field of Natural Language Processing (NLP) has been revolutionized by Transformer architectures. Models such as BERT, GPT, and RoBERTa have achieved state-of-the-art results on virtually all benchmarks. However, these performance gains come at a steep computational cost. The distinct architecture of transformers, which relies heavily on matrix multiplications and self-attention layers, requires vast amounts of floating-point operations (FLOPs).
+
+Training such models on a single Graphics Processing Unit (GPU) often results in bottlenecks, where training runs can extend for days or weeks. This latency impedes the research cycle, making hyperparameter tuning and experimentation difficult. High-Performance Computing (HPC) systems address this by providing nodes with multiple accelerators and high-bandwidth interconnects. Yet, leveraging these resources requires moving beyond standard sequential scripts to distributed execution models.
+
+The primary goal of this project is to bridge the gap between theoretical HPC capabilities and practical deep learning implementation. We aim to:
+\begin{enumerate}
+    \item \textbf{Analyze} the theoretical computational cost of transformers and the mathematical basis for distributed gradient updates.
+    \item \textbf{Scale} a realistic transformer workload (AG News topic classification with 120k samples) from 1 GPU to 4 GPUs.
+    \item \textbf{Evaluate} the performance trade-offs, specifically focusing on when DDP succeeds and when it fails, and identify the root causes of scaling inefficiency.
+    \item \textbf{Investigate} the impact of model size on distributed training efficiency through comparative experiments.
+\end{enumerate}
+
+\section{Theoretical background}
+
+To understand the necessity and mechanics of parallelization, we must first define the computational complexity of the workload and the mathematical formulation of the distributed optimization algorithm.
+
+\subsection{Computational complexity of transformers}
+The core component of a transformer is the scaled dot-product self-attention mechanism. For a sequence of length $L$ and hidden dimension $d$, the input is transformed into Query ($Q$), Key ($K$), and Value ($V$) matrices. The attention scores are computed as:
+
+$$ \text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d}}\right)V $$
+
+The matrix multiplication $QK^T$ results in an $L \times L$ matrix. Consequently, the time and memory complexity of this operation is $O(L^2 \cdot d)$. As the sequence length increases, the computational burden grows quadratically. Additionally, the Feed-Forward Networks (FFN) within each transformer block operate on every token independently but involve large dense matrix multiplications:
+
+$$ \text{FFN}(x) = \max(0, xW_1 + b_1)W_2 + b_2 $$
+
+For deep networks with dozens of layers and millions of parameters, the accumulation of gradients during the backward pass requires memory proportional to the number of parameters $|\theta|$ and the batch size $B$. This justifies the need for partitioning the workload across multiple devices.
+
+\subsection{Distributed Stochastic Gradient Descent (D-SGD)}
+The standard training objective is to minimize a loss function $\mathcal{L}(\theta)$ over a dataset $\mathcal{D}$. In standard SGD on a single device, the parameter update at step $t$ is given by:
+
+$$ \theta_{t+1} = \theta_t - \eta \cdot \nabla \mathcal{L}(\theta_t, \mathcal{B}_t) $$
+
+where $\eta$ is the learning rate and $\mathcal{B}_t$ is a mini-batch sampled from $\mathcal{D}$.
+
+In a Distributed Data Parallel (DDP) setting with $N$ GPUs, we employ a synchronous update scheme. The global mini-batch $\mathcal{B}_t$ is partitioned into $N$ non-overlapping sub-batches $\{b_t^1, b_t^2, \dots, b_t^N\}$. Each GPU $k$ maintains a local replica of the parameters $\theta_t$ and computes local gradients:
+
+$$ g_t^k = \nabla \mathcal{L}(\theta_t, b_t^k) $$
+
+To maintain mathematical equivalence with single-node training, the global gradient must be the average of all local gradients. Therefore, the distributed update rule becomes:
+
+$$ \theta_{t+1} = \theta_t - \eta \cdot \frac{1}{N} \sum_{k=1}^{N} g_t^k $$
+
+The critical operation here is the term $\sum_{k=1}^{N} g_t^k$. This requires an \texttt{all-reduce} operation where every GPU contributes its local gradient vector and receives the sum of all vectors.
+
+\subsection{Communication complexity: Ring All-Reduce}
+The scalability of the system is determined by the efficiency of the \texttt{all-reduce} operation. We utilize the NVIDIA Collective Communications Library (NCCL), which implements a Ring All-Reduce algorithm.
+
+In a ring topology, each GPU sends data to its right neighbor and receives from its left. For a model with $M$ parameters (size in bytes), the algorithm proceeds in two steps: Scatter-Reduce and All-Gather.
+The communication cost $T_{comm}$ for $N$ GPUs and bandwidth $BW$ is approximately:
+
+$$ T_{comm} \approx \frac{2(N-1)}{N} \cdot \frac{M}{BW} $$
+
+As $N \to \infty$, the term $\frac{2(N-1)}{N}$ approaches 2. This implies that the communication time is nearly independent of the number of GPUs for large $N$, making the algorithm highly scalable, provided that the latency does not dominate for small $M$.
+
+\textbf{Critical insight:} For positive speedup, we require:
+$$ T_{compute} >> T_{comm} $$
+
+When $T_{compute} \approx T_{comm}$ or $T_{compute} < T_{comm}$, distributed training becomes counterproductive, as our experiments will demonstrate.
+
+\section{System architecture and design}
+
+We utilized a Single Program Multiple Data (SPMD) architecture. This means the same training script runs on all devices, but each operates on different data slices.
+
+\subsection{Hardware and execution model}
+The experiments were conducted on an HPC compute node featuring 4 NVIDIA GPUs connected via NVLink/PCIe. The execution model assigns one dedicated Python process to each GPU to avoid the Global Interpreter Lock (GIL) contention that would occur with multi-threading.
+
+The workflow operates as follows:
+\begin{itemize}
+    \item \textbf{Process allocation:} Four independent processes are launched. The \texttt{torchrun} launcher handles the rank assignment (Rank 0 to 3) and sets up the distributed environment variables (MASTER\_ADDR, MASTER\_PORT).
+    \item \textbf{Communication backend:} NCCL is chosen over Gloo or MPI because it supports direct GPU-to-GPU memory access (GPUDirect), bypassing the CPU to lower latency.
+    \item \textbf{Gradient Synchronization:} PyTorch DDP registers autograd hooks. As soon as the backward pass computes the gradient for a specific layer, the hook triggers an asynchronous \texttt{all-reduce} call. This allows communication to overlap with the computation of gradients for subsequent layers.
+\end{itemize}
+
+\subsection{Parallel strategy: data parallelism}
+We rely strictly on data parallelism. The \texttt{DistributedSampler} plays a crucial role mathematically. It permutes the dataset indices based on the epoch number and the process rank:
+
+$$ I_{rank} = \{ i \in I_{global} \mid i \equiv rank \pmod N \} $$
+
+This ensures that the subsets processed by each GPU are disjoint ($I_i \cap I_j = \emptyset$ for $i \neq j$) and that their union covers the full dataset. The effective batch size of the training run becomes:
+$$ B_{effective} = N \times B_{local} $$
+
+\section{Implementation details}
+
+\subsection{Dataset specifications}
+The workload consists of the AG News topic classification dataset, a widely-used benchmark for text classification. The dataset comprises 120,000 training samples across 4 classes (World, Sports, Business, Sci/Tech). Text data is tokenized using a vocabulary of 20,000 tokens.
+
+\subsection{Model configurations}
+We conducted experiments with two distinct model architectures to investigate the impact of model size on distributed training efficiency:
+
+\textbf{Configuration 1: Baseline Small Model}
+\begin{itemize}
+    \item \textbf{Model dimension ($d_{model}$):} 128
+    \item \textbf{Number of attention heads:} 4
+    \item \textbf{Number of layers:} 2
+    \item \textbf{Feed-forward dimension:} 256
+    \item \textbf{Sequence length:} 128 tokens
+    \item \textbf{Batch size:} 32 (total)
+    \item \textbf{Approximate parameters:} $\sim$2M
+\end{itemize}
+
+\textbf{Configuration 2: Optimized Large Model}
+\begin{itemize}
+    \item \textbf{Model dimension ($d_{model}$):} 256
+    \item \textbf{Number of attention heads:} 8
+    \item \textbf{Number of layers:} 4
+    \item \textbf{Feed-forward dimension:} 1024
+    \item \textbf{Sequence length:} 256 tokens
+    \item \textbf{Batch size:} 128 (total, 32 per GPU in DDP)
+    \item \textbf{Approximate parameters:} $\sim$10M
+\end{itemize}
+
+\textbf{Common specifications:}
+\begin{itemize}
+    \item \textbf{Optimizer:} AdamW ($\beta_1=0.9, \beta_2=0.999$, weight decay=0.01)
+    \item \textbf{Loss Function:} Cross Entropy (4-class classification)
+    \item \textbf{Precision:} FP32 (Full Precision)
+    \item \textbf{Epochs:} 20
+\end{itemize}
+
+\subsection{Software stack}
+The implementation relies on:
+\begin{itemize}
+    \item \textbf{Python 3.11}: Runtime environment
+    \item \textbf{PyTorch 2.3}: Deep learning framework with \texttt{torch.distributed}
+    \item \textbf{Torchrun}: Elastic launch utility for fault-tolerant distributed processing
+    \item \textbf{NCCL}: GPU-to-GPU communication library
+\end{itemize}
+
+\section{Performance evaluation}
+
+\subsection{Experimental setup}
+We conducted four primary experiments to measure scalability across two model sizes:
+\begin{enumerate}
+    \item \textbf{Small Model, 1 GPU:} Baseline for small architecture
+    \item \textbf{Small Model, 4 GPUs:} DDP with small architecture
+    \item \textbf{Large Model, 1 GPU:} Baseline for large architecture
+    \item \textbf{Large Model, 4 GPUs:} DDP with large architecture
+\end{enumerate}
+
+All experiments ran for 20 epochs. We logged wall-clock time per epoch, training loss, and validation accuracy. The first epoch was excluded from timing analysis to account for JIT compilation overhead.
+
+\subsection{Results: Baseline small model}
+
+\begin{table}[H]
+\centering
+\caption{Performance metrics: Small model (d\_model=128, 2 layers, batch=32)}
+\label{tab:small}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Metric} & \textbf{1 GPU} & \textbf{4 GPUs} \\ \midrule
+Training samples & 120,000 & 120,000 \\
+Mean epoch time (s) & 19.53 $\pm$ 0.63 & 42.34 $\pm$ 0.51 \\
+Total training time (s) & 391.9 & 1,481.9 \\
+Speedup & 1.00$\times$ & \textcolor{red}{0.46$\times$} \\
+Parallel efficiency & 100\% & \textcolor{red}{11.5\%} \\
+Throughput (samples/s) & 6,143 & 2,835 \\
+Final validation accuracy & 88.6\% & 88.4\% \\ \bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Analysis:} The small model exhibits \textit{negative scaling} — training on 4 GPUs is 2.2$\times$ \textit{slower} than on 1 GPU. This counterintuitive result occurs because the communication overhead ($T_{comm} \approx 30-35$ms) exceeds the computation time ($T_{compute} \approx 15-20$ms). Each GPU spends more time synchronizing gradients than performing forward/backward passes.
+
+\subsection{Results: Optimized large model}
+
+\begin{table}[H]
+\centering
+\caption{Performance metrics: Large model (d\_model=256, 4 layers, batch=128)}
+\label{tab:large}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Metric} & \textbf{1 GPU} & \textbf{4 GPUs} \\ \midrule
+Training samples & 120,000 & 120,000 \\
+Mean epoch time (s) & 99.94 $\pm$ 0.20 & 124.95 $\pm$ 1.02 \\
+Total training time (s) & 2,000 & 2,499 \\
+Speedup & 1.00$\times$ & \textcolor{red}{0.80$\times$} \\
+Parallel efficiency & 100\% & \textcolor{red}{20.0\%} \\
+Throughput (samples/s) & 1,200 & 960 \\
+Final validation accuracy & 89.2\% & 89.2\% \\ \bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Analysis:} Despite increasing the model size by 5$\times$ and batch size by 4$\times$, the large model \textit{still} exhibits negative scaling (0.80$\times$ speedup). While the efficiency improved from 11.5\% to 20\%, training remains slower on 4 GPUs than on 1 GPU. This indicates that even the larger model has insufficient compute-to-communication ratio for this hardware configuration.
+
+\subsection{Comparative analysis}
+
+Figure~\ref{fig:comparison} shows the epoch times for all four configurations. The key observation is that both multi-GPU configurations are slower than their single-GPU counterparts.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{figures/epoch_time_comparison.png}
+    \caption{Training time per epoch across all configurations. Both 4-GPU configurations exhibit longer epoch times than their 1-GPU baselines.}
+    \label{fig:comparison}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{figures/speedup_comparison.png}
+    \caption{Speedup comparison. The dashed line represents ideal linear scaling (4$\times$). Both configurations fall significantly below the ideal, with speedups of 0.46$\times$ and 0.80$\times$ respectively.}
+    \label{fig:speedup}
+\end{figure}
+
+\subsection{Model accuracy verification}
+Table~\ref{tab:accuracy} shows that distributed training preserved model accuracy across both configurations, confirming that the mathematical correctness of gradient averaging is maintained despite the performance inefficiency.
+
+\begin{table}[H]
+\centering
+\caption{Validation accuracy comparison}
+\label{tab:accuracy}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Configuration} & \textbf{1 GPU} & \textbf{4 GPUs} \\ \midrule
+Small model & 88.6\% & 88.4\% \\
+Large model & 89.2\% & 89.2\% \\ \bottomrule
+\end{tabular}
+\end{table}
+
+\section{Discussion}
+
+\subsection{Root cause analysis}
+
+The negative scaling observed in our experiments can be attributed to an unfavorable compute-to-communication ratio. Let us define:
+
+$$ R = \frac{T_{compute}}{T_{comm}} $$
+
+For positive speedup in DDP, we require $R >> 1$. In our case:
+
+\textbf{Small model:}
+\begin{itemize}
+    \item $T_{compute} \approx 15-20$ms (measured per batch)
+    \item $T_{comm} \approx 30-35$ms (all-reduce of $\sim$2M parameters)
+    \item $R \approx 0.5-0.6$ \textcolor{red}{(Bad)}
+\end{itemize}
+
+\textbf{Large model:}
+\begin{itemize}
+    \item $T_{compute} \approx 80-90$ms (5$\times$ more parameters, 4$\times$ larger batch)
+    \item $T_{comm} \approx 70-80$ms (all-reduce of $\sim$10M parameters)
+    \item $R \approx 1.0-1.1$ \textcolor{orange}{(Marginal)}
+\end{itemize}
+
+For effective DDP, empirical evidence suggests $R \geq 3.0$ is required. Neither of our configurations achieved this threshold.
+
+\subsection{Bottleneck analysis via Amdahl's Law}
+
+Amdahl's Law provides a theoretical upper bound on speedup:
+
+$$ S_{max}(N) = \frac{1}{(1 - P_{parallel}) + \frac{P_{parallel}}{N}} $$
+
+From our measured efficiencies, we can estimate the parallel fraction:
+
+\textbf{Small model:} $E = 0.115 \Rightarrow P_{parallel} \approx 0.43$ (57\% serial)
+
+\textbf{Large model:} $E = 0.20 \Rightarrow P_{parallel} \approx 0.60$ (40\% serial)
+
+These low parallel fractions indicate that gradient synchronization and associated overheads dominate the training loop. The "serial" components include:
+\begin{itemize}
+    \item \textbf{Communication latency:} The all-reduce operation is fundamentally a synchronization point
+    \item \textbf{Data loading:} CPU preprocessing becomes relatively more significant when GPU compute is fast
+    \item \textbf{Kernel launch overhead:} CUDA kernel invocation latency
+\end{itemize}
+
+\subsection{Why did scaling fail?}
+
+Several factors contributed to the negative scaling:
+
+\begin{enumerate}
+    \item \textbf{Model size too small:} Even at 10M parameters, the model is not large enough to amortize communication costs. State-of-the-art NLP models (BERT-base: 110M, GPT-3: 175B) are 10-10,000$\times$ larger.
+
+    \item \textbf{Short sequence length:} At 128-256 tokens, the attention mechanism ($O(L^2 d)$) is not computationally intensive enough. Modern models use 512-2048 tokens.
+
+    \item \textbf{Batch size per GPU:} With batch sizes of 8-32 per GPU, each GPU is underutilized. Modern training uses batch sizes of 32-64 \textit{per GPU}.
+
+    \item \textbf{Fast baseline:} The single-GPU baseline completes epochs in 19-100 seconds. This leaves little room for speedup when communication overhead is fixed at 30-80ms per batch.
+
+    \item \textbf{Hardware interconnect:} PCIe bandwidth ($\sim$16 GB/s per direction) may be insufficient. NVLink ($\sim$300 GB/s) or InfiniBand would reduce $T_{comm}$ significantly.
+\end{enumerate}
+
+\subsection{When does DDP succeed?}
+
+Based on our findings and literature, DDP achieves positive speedup when:
+
+\begin{equation}
+R = \frac{T_{compute}}{T_{comm}} = \frac{\text{FLOPs per batch} / \text{GPU TFLOPS}}{\text{Model size} / \text{Bandwidth}} \geq 3.0
+\end{equation}
+
+This can be achieved by:
+\begin{itemize}
+    \item \textbf{Larger models:} 100M+ parameters (50-100$\times$ our size)
+    \item \textbf{Larger batch sizes:} 64-128 per GPU (vs our 8-32)
+    \item \textbf{Longer sequences:} 512-2048 tokens (vs our 128-256)
+    \item \textbf{Better interconnect:} NVLink or InfiniBand (10-20$\times$ faster)
+\end{itemize}
+
+\subsection{Lessons learned}
+
+This project demonstrates that distributed training is \textit{not universally beneficial}. Key insights:
+
+\begin{enumerate}
+    \item \textbf{Small models don't scale:} Communication overhead is a fixed cost that becomes prohibitive for small models.
+
+    \item \textbf{Measure before deploying:} Always profile single-GPU performance and estimate $T_{comm}$ before investing in distributed training infrastructure.
+
+    \item \textbf{Consider alternatives:}
+    \begin{itemize}
+        \item \textit{Gradient accumulation:} Simulate large batches on 1 GPU without DDP overhead
+        \item \textit{Mixed precision (FP16):} Reduces $T_{comm}$ by 2$\times$
+        \item \textit{Model parallelism:} For models too large to fit on 1 GPU
+    \end{itemize}
+
+    \item \textbf{Hardware matters:} The 4$\times$ speedup claimed in PyTorch documentation assumes high-bandwidth interconnects (NVLink) and large models (BERT-scale).
+\end{enumerate}
+
+\section{Conclusion}
+
+This project successfully demonstrated the practical limitations of Distributed Data Parallel training for small-to-medium transformer models. Through systematic experimentation with two model configurations on the AG News dataset (120k samples), we observed negative scaling in both cases:
+
+\begin{itemize}
+    \item \textbf{Small model (2M params):} 0.46$\times$ speedup on 4 GPUs (11.5\% efficiency)
+    \item \textbf{Large model (10M params):} 0.80$\times$ speedup on 4 GPUs (20\% efficiency)
+\end{itemize}
+
+These results, while disappointing from a performance perspective, provide valuable insights into the compute-to-communication ratio requirements for effective distributed training. Our theoretical analysis confirms that the observed negative scaling aligns with predictions from Amdahl's Law and the ring all-reduce communication complexity.
+
+\textbf{Key takeaway:} DDP is a powerful technique, but it requires careful consideration of model size, batch size, sequence length, and hardware interconnect. For small models ($<$50M parameters), single-GPU training with gradient accumulation is often more efficient than multi-GPU DDP.
+
+\textbf{Future work:} To achieve positive speedup on this dataset, we recommend: (1) scaling to BERT-base size models (110M+ parameters), (2) using mixed-precision training (FP16/BF16) to halve communication costs, (3) upgrading to NVLink-connected GPUs, or (4) employing gradient accumulation to increase effective batch size without DDP overhead.
+
+This project underscores that understanding \textit{when not to use} distributed training is as important as understanding how to implement it correctly.
+
+\end{document}

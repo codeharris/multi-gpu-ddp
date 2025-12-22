@@ -1,0 +1,28 @@
+experiment_name: "ag_news_ddp_4gpu_20ep_optimized"
+output_dir: "experiments/exp043_agnews_ddp_4gpu_20ep_optimized"
+
+seed: 42
+
+model:
+  type: "transformer_sequence_classifier"
+  d_model: 256        # Increased from 128
+  n_heads: 8          # Increased from 4
+  num_layers: 4       # Increased from 2
+  dim_feedforward: 1024  # Increased from 256
+  dropout: 0.1
+  vocab_size: 20000
+  num_classes: 4
+  max_seq_len: 256    # Increased from 128
+
+data:
+  dataset: "ag_news"
+  num_workers: 4      # Increased from 2
+  pin_memory: true
+
+training:
+  epochs: 20
+  batch_size: 128     # Increased from 32 (32 per GPU = 4x better)
+
+distributed:
+  use_ddp: true
+  backend: "nccl"

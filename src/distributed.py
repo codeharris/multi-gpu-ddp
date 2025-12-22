@@ -32,6 +32,13 @@ def setup_distributed(cfg):
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
 
+    # Sanity check: prevent "invalid device ordinal" errors
+    if local_rank >= torch.cuda.device_count():
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} but only {torch.cuda.device_count()} GPUs available. "
+            f"Check your launcher settings or CUDA_VISIBLE_DEVICES."
+        )
+
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 

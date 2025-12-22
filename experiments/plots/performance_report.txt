@@ -1,0 +1,35 @@
+================================================================================
+MULTI-GPU DDP PERFORMANCE ANALYSIS REPORT
+================================================================================
+
+
+============================================================
+Configuration: AGNews_1 GPU
+============================================================
+Dataset: AGNews (train size: 120000)
+Mean epoch time: 19.53 ± 0.63 s
+Total training time: 391.9 s (6.5 min)
+Throughput: 6143 samples/sec
+Speedup: 1.00x
+Parallel efficiency: 100.0%
+
+✓ Excellent scaling performance!
+Final validation accuracy: 0.886
+
+
+============================================================
+Configuration: AGNews_4 GPUs
+============================================================
+Dataset: AGNews (train size: 120000)
+Mean epoch time: 42.33 ± 0.51 s
+Total training time: 1481.9 s (24.7 min)
+Throughput: 2835 samples/sec
+Speedup: 0.46x
+Parallel efficiency: 11.5%
+
+⚠️  WARNING: Negative scaling detected!
+   Recommendations:
+   - Increase model size (more layers, wider dimensions)
+   - Increase batch size to improve compute-to-communication ratio
+   - Consider using gradient accumulation instead of DDP
+Final validation accuracy: 0.884
