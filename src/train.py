@@ -12,6 +12,7 @@ from config import load_config
 from distributed import setup_distributed, cleanup_distributed
 from data.dataset import build_dataloaders
 from models.transformer_model import build_model
+from models.distilbert_model import DistilBertClassifier
 
 
 # ---------------------------
@@ -43,22 +44,37 @@ class AverageMeter:
 # ---------------------------
 # Training loop (1 epoch)
 # ---------------------------
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch(model, loader, criterion, optimizer, device, use_distilbert=False):
     model.train()
     meter = AverageMeter()
     start_time = time.time()
 
-    for x, y in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
+    for batch in loader:
+        if use_distilbert:
+            # DistilBERT returns (input_ids, attention_mask, label)
+            x, mask, y = batch
+            x = x.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(x, attention_mask=mask)
+            loss = criterion(outputs, y)
+            loss.backward()
+            optimizer.step()
+        else:
+            # Transformer returns (input_ids, label)
+            x, y = batch
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
-        outputs = model(x)
-        loss = criterion(outputs, y)
-        loss.backward()
-        optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(x)
+            loss = criterion(outputs, y)
+            loss.backward()
+            optimizer.step()
 
-        meter.update(loss.item(), x.size(0))
+        meter.update(loss.item(), y.size(0))
 
     elapsed = time.time() - start_time
     return meter.avg, elapsed
@@ -68,19 +84,29 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
 # Validation
 # ---------------------------
 @torch.no_grad()
-def validate(model, loader, criterion, device):
+def validate(model, loader, criterion, device, use_distilbert=False):
     model.eval()
     meter = AverageMeter()
     correct = 0
     total = 0
 
-    for x, y in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
+    for batch in loader:
+        if use_distilbert:
+            # DistilBERT returns (input_ids, attention_mask, label)
+            x, mask, y = batch
+            x = x.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            outputs = model(x, attention_mask=mask)
+        else:
+            # Transformer returns (input_ids, label)
+            x, y = batch
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            outputs = model(x)
 
-        outputs = model(x)
         loss = criterion(outputs, y)
-        meter.update(loss.item(), x.size(0))
+        meter.update(loss.item(), y.size(0))
 
         preds = outputs.argmax(dim=1)
         correct += (preds == y).sum().item()
@@ -105,11 +131,25 @@ def main():
     if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True
 
+    # Check if using DistilBERT
+    model_type = cfg["model"].get("type", "transformer")
+    use_distilbert = (model_type == "distilbert")
+    
     # Data
     train_loader, val_loader = build_dataloaders(cfg, dist_state)
 
     # Model
-    model = build_model(cfg["model"]).to(device)
+    if use_distilbert:
+        num_classes = int(cfg["model"]["num_classes"])
+        pretrained = cfg["model"].get("pretrained", True)
+        model = DistilBertClassifier(num_classes=num_classes, pretrained=pretrained).to(device)
+        
+        if dist_state.is_main_process:
+            total_params, trainable_params = model.count_parameters()
+            print(f"📊 DistilBERT - Total params: {total_params:,} | Trainable: {trainable_params:,}")
+    else:
+        model = build_model(cfg["model"]).to(device)
+    
     if dist_state.use_ddp:
         model = DDP(
             model, 
@@ -119,7 +159,8 @@ def main():
 
     # Loss & optimizer
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=3e-4)
+    lr = float(cfg["training"].get("learning_rate", 3e-4))
+    optimizer = optim.Adam(model.parameters(), lr=lr)
 
     # Output directory
     out_dir = Path(cfg["output_dir"])
@@ -147,11 +188,11 @@ def main():
             sampler.set_epoch(epoch)
 
         train_loss, train_time = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
+            model, train_loader, criterion, optimizer, device, use_distilbert
         )
 
         val_loss, val_acc = validate(
-            model, val_loader, criterion, device
+            model, val_loader, criterion, device, use_distilbert
         )
 
         if dist_state.is_main_process:

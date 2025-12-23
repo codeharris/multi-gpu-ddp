@@ -1,0 +1,28 @@
+# AG News Classification with DistilBERT (4 GPUs with DDP)
+# Expected: 2-3x speedup (finally positive scaling!)
+# Model: ~66M parameters (6x larger than optimized custom transformer)
+
+experiment_name: "ag_news_distilbert_ddp_4gpu"
+output_dir: "experiments/exp046_agnews_distilbert_ddp_4gpu"
+
+seed: 42
+
+model:
+  type: "distilbert"  # Use DistilBERT instead of custom transformer
+  pretrained: true    # Use pre-trained weights from HuggingFace
+  num_classes: 4
+  max_seq_len: 256    # DistilBERT can handle up to 512
+
+data:
+  dataset: "ag_news_distilbert"  # Uses real tokenizer
+  num_workers: 4
+  pin_memory: true
+
+training:
+  epochs: 10          # Reduced epochs since pre-trained
+  batch_size: 128     # Total batch size (32 per GPU with 4 GPUs)
+  learning_rate: 2e-5 # Lower LR for fine-tuning pre-trained model
+
+distributed:
+  use_ddp: true
+  backend: "nccl"

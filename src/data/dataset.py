@@ -86,6 +86,49 @@ class HFTextClassificationDataset(Dataset):
         return x, y
 
 
+class HFTextClassificationDatasetWithTokenizer(Dataset):
+    """
+    Wraps a HuggingFace dataset and uses a real tokenizer (for DistilBERT, etc.)
+    Returns: (input_ids, attention_mask, label)
+    """
+    def __init__(
+        self,
+        hf_split,
+        tokenizer,
+        text_field: str,
+        label_field: str,
+        max_len: int,
+    ):
+        self.ds = hf_split
+        self.tokenizer = tokenizer
+        self.text_field = text_field
+        self.label_field = label_field
+        self.max_len = max_len
+
+    def __len__(self) -> int:
+        return len(self.ds)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        item = self.ds[int(idx)]
+        text = item[self.text_field]
+        label = int(item[self.label_field])
+        
+        # Tokenize with transformer tokenizer
+        encoded = self.tokenizer(
+            text,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        
+        input_ids = encoded['input_ids'].squeeze(0)
+        attention_mask = encoded['attention_mask'].squeeze(0)
+        y = torch.tensor(label, dtype=torch.long)
+        
+        return input_ids, attention_mask, y
+
+
 # -----------------------------
 # Public API
 # -----------------------------
@@ -96,18 +139,22 @@ def build_dataloaders(cfg: Dict, dist_state) -> Tuple[DataLoader, DataLoader]:
       - synthetic
       - imdb_hash
       - ag_news
+      - ag_news_distilbert (with real tokenizer)
     """
     data_cfg = cfg.get("data", {})
     dataset_name = data_cfg.get("dataset", "synthetic")
 
     train_bs = int(cfg["training"]["batch_size"])
     max_len = int(cfg["model"]["max_seq_len"])
-    vocab_size = int(cfg["model"]["vocab_size"])
+    vocab_size = int(cfg["model"].get("vocab_size", 30000))
     num_classes = int(cfg["model"]["num_classes"])
 
     num_workers = int(data_cfg.get("num_workers", 2))
     pin_memory = bool(data_cfg.get("pin_memory", True))
     persistent_workers = num_workers > 0  # Avoid worker teardown
+    
+    # Check if using DistilBERT
+    use_distilbert = (cfg["model"].get("type", "transformer") == "distilbert")
 
     # -------- build datasets --------
     if dataset_name == "synthetic":
@@ -131,7 +178,7 @@ def build_dataloaders(cfg: Dict, dist_state) -> Tuple[DataLoader, DataLoader]:
             seed=seed + 1,
         )
 
-    elif dataset_name in ("imdb_hash", "ag_news"):
+    elif dataset_name in ("imdb_hash", "ag_news", "ag_news_distilbert"):
         if load_dataset is None:
             raise RuntimeError("huggingface 'datasets' is not available. Install it: pip install datasets")
 
@@ -144,7 +191,7 @@ def build_dataloaders(cfg: Dict, dist_state) -> Tuple[DataLoader, DataLoader]:
             test_split = raw["test"]
 
         else:
-            # AG News: train/test
+            # AG News: train/test (both ag_news and ag_news_distilbert)
             raw = load_dataset("ag_news")
             text_field = "text"
             label_field = "label"
@@ -159,20 +206,40 @@ def build_dataloaders(cfg: Dict, dist_state) -> Tuple[DataLoader, DataLoader]:
         if val_limit is not None:
             test_split = test_split.select(range(int(val_limit)))
 
-        train_dataset = HFTextClassificationDataset(
-            hf_split=train_split,
-            text_field=text_field,
-            label_field=label_field,
-            vocab_size=vocab_size,
-            max_len=max_len,
-        )
-        val_dataset = HFTextClassificationDataset(
-            hf_split=test_split,
-            text_field=text_field,
-            label_field=label_field,
-            vocab_size=vocab_size,
-            max_len=max_len,
-        )
+        # Use proper tokenizer for DistilBERT
+        if use_distilbert or dataset_name == "ag_news_distilbert":
+            from transformers import DistilBertTokenizer
+            tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+            
+            train_dataset = HFTextClassificationDatasetWithTokenizer(
+                hf_split=train_split,
+                tokenizer=tokenizer,
+                text_field=text_field,
+                label_field=label_field,
+                max_len=max_len,
+            )
+            val_dataset = HFTextClassificationDatasetWithTokenizer(
+                hf_split=test_split,
+                tokenizer=tokenizer,
+                text_field=text_field,
+                label_field=label_field,
+                max_len=max_len,
+            )
+        else:
+            train_dataset = HFTextClassificationDataset(
+                hf_split=train_split,
+                text_field=text_field,
+                label_field=label_field,
+                vocab_size=vocab_size,
+                max_len=max_len,
+            )
+            val_dataset = HFTextClassificationDataset(
+                hf_split=test_split,
+                text_field=text_field,
+                label_field=label_field,
+                vocab_size=vocab_size,
+                max_len=max_len,
+            )
 
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")

@@ -1,0 +1,27 @@
+# Quick test config for local testing (uses tiny subset)
+experiment_name: "ag_news_distilbert_test"
+output_dir: "experiments/test_distilbert"
+
+seed: 42
+
+model:
+  type: "distilbert"
+  pretrained: true
+  num_classes: 4
+  max_seq_len: 128  # Shorter for faster testing
+
+data:
+  dataset: "ag_news_distilbert"
+  num_workers: 0     # No multiprocessing for local test
+  pin_memory: false  # Disable for local test
+  train_limit: 1000  # Only 1000 samples for testing
+  val_limit: 200     # Only 200 samples for validation
+
+training:
+  epochs: 2          # Just 2 epochs to verify it works
+  batch_size: 16     # Smaller batch for testing
+  learning_rate: 2e-5
+
+distributed:
+  use_ddp: false
+  backend: "nccl"
