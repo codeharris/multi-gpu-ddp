@@ -8,21 +8,20 @@
 
 #SBATCH -J ddp_1node_param
 #SBATCH -N 1
-#SBATCH --gres=gpu:4
-#SBATCH --ntasks-per-node=1
-#SBATCH -c 4
-#SBATCH --time=0-01:00:00
+#SBATCH --gres=gpu:2
+#SBATCH --ntasks-per-node=2
+#SBATCH -c 7
+#SBATCH --time=0-02:00:00
 #SBATCH -p gpu
-#SBATCH --output=ddp_1node_%j.out
-#SBATCH --error=ddp_1node_%j.err
+#SBATCH --output=ddp_1node_2gpu_%j.out
+#SBATCH --error=ddp_1node_2gpu_%j.err
 
-if [[ $# -lt 2 ]]; then
-  echo "Usage: $0 <config_path> <gpus>" >&2
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <config_path>" >&2
   exit 1
 fi
 
 CONFIG="$1"
-GPUS="$2"
 
 if [[ ! -f "$CONFIG" ]]; then
   echo "Error: config file not found: $CONFIG" >&2
@@ -44,6 +43,11 @@ cd "$SLURM_SUBMIT_DIR" || exit 1
 
 # Load Python (adapt if needed)
 module load lang/Python/3.11.5-GCCcore-13.2.0
+module load data/scikit-learn
+module load vis/matplotlib
+module load bio/Seaborn/0.13.2-gfbf-2023b
+module load lib/mpi4py/3.1.5-gompi-2023b
+module load ai/PyTorch/2.3.0-foss-2023b-CUDA-12.6.0
 
 # Activate venv
 if [[ -f .venv_cluster/bin/activate ]]; then
@@ -74,14 +78,12 @@ echo "=========================================="
 
 START_TIME=$(date +%s)
 
-if [[ "$GPUS" -gt 1 ]]; then
-  torchrun \
-    --nproc_per_node="$GPUS" \
-    src/train.py \
-    --config "$CONFIG"
-else
-  python src/train.py --config "$CONFIG"
-fi
+
+torchrun \
+--nproc_per_node=2 \
+src/train.py \
+--config "$CONFIG"
+
 
 END_TIME=$(date +%s)
 

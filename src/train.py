@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -50,14 +51,39 @@ def _forward_logits(model, x):
     return out
 
 
+def _batch_num_bytes(batch):
+    def tensor_bytes(t):
+        try:
+            return t.numel() * t.element_size()
+        except Exception:
+            return 0
+
+    if isinstance(batch, dict):
+        total = 0
+        for v in batch.values():
+            if isinstance(v, torch.Tensor):
+                total += tensor_bytes(v)
+        return total
+    if isinstance(batch, torch.Tensor):
+        return tensor_bytes(batch)
+    return 0
+
+
 def train_one_epoch(model, loader, criterion, optimizer, device, amp_enabled: bool, scaler: GradScaler):
     model.train()
     meter = AverageMeter()
     start = time.time()
+    transfer_time = 0.0
+    transfer_bytes = 0
 
     for x, y in loader:
+        t0 = time.time()
         x = _move_to_device(x, device)
         y = y.to(device, non_blocking=True)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        transfer_time += (time.time() - t0)
+        transfer_bytes += int(_batch_num_bytes(x)) + int(y.numel() * y.element_size())
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(enabled=amp_enabled):
@@ -75,7 +101,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, amp_enabled: bo
         bsz = y.size(0)
         meter.update(loss.item(), bsz)
 
-    return meter.avg, time.time() - start
+    return meter.avg, time.time() - start, transfer_time, transfer_bytes
 
 
 @torch.no_grad()
@@ -83,10 +109,17 @@ def validate(model, loader, criterion, device, amp_enabled: bool):
     model.eval()
     meter = AverageMeter()
     correct = total = 0
+    transfer_time = 0.0
+    transfer_bytes = 0
 
     for x, y in loader:
+        t0 = time.time()
         x = _move_to_device(x, device)
         y = y.to(device, non_blocking=True)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        transfer_time += (time.time() - t0)
+        transfer_bytes += int(_batch_num_bytes(x)) + int(y.numel() * y.element_size())
 
         with autocast(enabled=amp_enabled):
             logits = _forward_logits(model, x)
@@ -97,7 +130,30 @@ def validate(model, loader, criterion, device, amp_enabled: bool):
         correct += (pred == y).sum().item()
         total += y.size(0)
 
-    return meter.avg, correct / max(total, 1)
+    # Aggregate across ranks if using DDP
+    if dist.is_initialized():
+        # Reduce sums and counts for loss
+        sum_loss = torch.tensor(meter.sum, dtype=torch.double, device=device)
+        count_loss = torch.tensor(meter.count, dtype=torch.double, device=device)
+        correct_t = torch.tensor(correct, dtype=torch.double, device=device)
+        total_t = torch.tensor(total, dtype=torch.double, device=device)
+        trans_time_t = torch.tensor(transfer_time, dtype=torch.double, device=device)
+        trans_bytes_t = torch.tensor(transfer_bytes, dtype=torch.double, device=device)
+
+        dist.all_reduce(sum_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(count_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(correct_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(trans_time_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(trans_bytes_t, op=dist.ReduceOp.SUM)
+
+        global_val_loss = (sum_loss / torch.clamp(count_loss, min=1.0)).item()
+        global_val_acc = (correct_t / torch.clamp(total_t, min=1.0)).item()
+        global_transfer_time = trans_time_t.item()
+        global_transfer_bytes = int(trans_bytes_t.item())
+        return global_val_loss, global_val_acc, global_transfer_time, global_transfer_bytes
+
+    return meter.avg, correct / max(total, 1), transfer_time, transfer_bytes
 
 
 def main():
@@ -152,10 +208,20 @@ def main():
         if dist_state.use_ddp:
             train_loader.sampler.set_epoch(epoch)
 
-        tr_loss, tr_time = train_one_epoch(
+        tr_loss, tr_time, tr_transfer_time, tr_transfer_bytes = train_one_epoch(
             model, train_loader, criterion, optimizer, device, amp_enabled, scaler
         )
-        val_loss, val_acc = validate(model, val_loader, criterion, device, amp_enabled)
+        # Aggregate training transfer metrics across ranks for global totals
+        if dist.is_initialized():
+            tr_time_t = torch.tensor(tr_transfer_time, dtype=torch.double, device=device)
+            tr_bytes_t = torch.tensor(tr_transfer_bytes, dtype=torch.double, device=device)
+            dist.all_reduce(tr_time_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(tr_bytes_t, op=dist.ReduceOp.SUM)
+            tr_transfer_time = tr_time_t.item()
+            tr_transfer_bytes = int(tr_bytes_t.item())
+        val_loss, val_acc, val_transfer_time, val_transfer_bytes = validate(
+            model, val_loader, criterion, device, amp_enabled
+        )
 
         total_train_time += float(tr_time)
         if val_acc > best_val_acc:
@@ -171,6 +237,10 @@ def main():
             "train_time": float(tr_time),
             "val_loss": float(val_loss),
             "val_acc": float(val_acc),
+            "train_data_transfer_time_sec": float(tr_transfer_time),
+            "train_data_transfer_bytes": int(tr_transfer_bytes),
+            "val_data_transfer_time_sec": float(val_transfer_time),
+            "val_data_transfer_bytes": int(val_transfer_bytes),
         })
 
         if dist_state.is_main_process:
@@ -189,6 +259,12 @@ def main():
     if dist_state.is_main_process:
         try:
             avg_train_time = total_train_time / max(len(per_epoch), 1)
+            # Aggregate data transfer across epochs
+            agg_train_transfer_time = float(sum(e.get("train_data_transfer_time_sec", 0.0) for e in per_epoch))
+            agg_val_transfer_time = float(sum(e.get("val_data_transfer_time_sec", 0.0) for e in per_epoch))
+            agg_train_transfer_bytes = int(sum(e.get("train_data_transfer_bytes", 0) for e in per_epoch))
+            agg_val_transfer_bytes = int(sum(e.get("val_data_transfer_bytes", 0) for e in per_epoch))
+
             summary = {
                 "experiment_name": cfg.get("experiment_name", None),
                 "output_dir": str(out_dir),
@@ -217,6 +293,12 @@ def main():
                     "final_val_acc": float(per_epoch[-1]["val_acc"]) if per_epoch else None,
                     "final_val_loss": float(per_epoch[-1]["val_loss"]) if per_epoch else None,
                     "wall_time_sec": float(time.time() - run_start_time),
+                    "data_transfer": {
+                        "train_total_time_sec": float(agg_train_transfer_time),
+                        "val_total_time_sec": float(agg_val_transfer_time),
+                        "train_total_bytes": int(agg_train_transfer_bytes),
+                        "val_total_bytes": int(agg_val_transfer_bytes),
+                    },
                 },
             }
             with json_path.open("w", encoding="utf-8") as jf:

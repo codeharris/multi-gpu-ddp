@@ -145,7 +145,12 @@ def build_dataloaders(cfg: dict, dist_state):
             rank=dist_state.rank,
             shuffle=True,
         )
-        val_sampler = None
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=dist_state.world_size,
+            rank=dist_state.rank,
+            shuffle=False,
+        )
     else:
         train_sampler = None
         val_sampler = None

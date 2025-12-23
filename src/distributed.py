@@ -32,11 +32,30 @@ def setup_distributed(cfg):
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
 
+    # Validate CUDA availability and visible device count before selecting device
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is not available. If you intend to run DDP on CPU, set distributed.use_ddp=false or use backend 'gloo' and remove device_ids in DDP."
+        )
+
+    num_visible = torch.cuda.device_count()
+    if local_rank >= num_visible:
+        vis = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        raise RuntimeError(
+            (
+                f"CUDA invalid device ordinal: LOCAL_RANK={local_rank} but only {num_visible} device(s) are visible. "
+                f"CUDA_VISIBLE_DEVICES={vis}. "
+                "Fix by matching --nproc_per_node to the number of visible GPUs on this node, "
+                "or adjust CUDA_VISIBLE_DEVICES accordingly."
+            )
+        )
+
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", init_method="env://")
+        backend = cfg.get("backend", "nccl")
+        dist.init_process_group(backend=backend, init_method="env://")
 
     is_main = (rank == 0)
 
